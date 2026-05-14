@@ -1,24 +1,30 @@
-"""规则门控节点 (Gatekeeper Node).
+"""Gatekeeper node. 用轻量规则判断是否需要生成失败诊断报告。"""
 
-通过轻量级、无 LLM 的硬编码规则，快速过滤正常的测试，节约大模型分析成本。
-"""
 from src.state import PipelineState
 
-def rule_gate(state: PipelineState) -> dict:
-    """规则门控判断。"""
-    print("--> [rule_gate] 规则引擎校验中...")
+
+def rule_gate(state: PipelineState) -> dict[str, str]:
+    """Route failed pytest or failed observation into report generation."""
+    print("--> [rule_gate] checking result")
     test_result = state.get("test_result", {})
-    state_diff = state.get("state_diff", "")
-    
-    # 规则 1：如果测试脚本直接报非零退出码，拦截去排查
+    timed_out = bool(test_result.get("timed_out", False))
+
+    if timed_out:
+        print("    [Gate FAIL] pytest timed out")
+        return {"gate_decision": "FAIL"}
+
     if test_result.get("exit_code", 0) != 0:
-        print("    [Gate FAIL] 测试断言失败！导向排障流。")
+        print("    [Gate FAIL] pytest failed")
         return {"gate_decision": "FAIL"}
-        
-    # 规则 2：如果 Diff 中看到了 Error 日志，哪怕测试是绿的也要查（抓脏数据）
-    if "Error" in state_diff or "Exception" in state_diff:
-        print("    [Gate FAIL] 测试虽过，但基建爆出 Error！导向排障流。")
+
+    observability_status = state.get("observability_status", "")
+    if observability_status == "error_detected":
+        print("    [Gate FAIL] sidecar logs contain errors")
         return {"gate_decision": "FAIL"}
-        
-    print("    [Gate PASS] 一切正常，放行。")
+
+    if state.get("mcp_error"):
+        print("    [Gate FAIL] sidecar MCP observation failed")
+        return {"gate_decision": "FAIL"}
+
+    print("    [Gate PASS] pytest passed")
     return {"gate_decision": "PASS"}

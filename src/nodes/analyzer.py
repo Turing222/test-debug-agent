@@ -1,36 +1,106 @@
-"""分析与报告节点 (Analyzer Nodes).
+"""Analyzer and report nodes. 生成版本 A 的确定性诊断摘要和 Markdown 报告。"""
 
-在规则门控判定异常时，调用大模型进行深度排障推理并生成人类可读报告。
-"""
+import re
+import time
+from pathlib import Path
+
 from src.state import PipelineState
 
-def evaluate_or_analyze(state: PipelineState) -> dict:
-    """LLM 深度诊断排障。"""
-    print("--> [analyzer] 请求大模型进行 Root Cause 诊断...")
-    # 真实场景中，这里会调用 LLM，喂入用例名称、stderr 和 state_diff
-    mock_analysis = "分析结论：由于 Redis 连接超时 (TimeoutError)，导致鉴权 Token 未被正确清理，发生了死键泄露。"
-    return {"analysis_result": mock_analysis}
+TAIL_CHARS = 4000
 
-def generate_report(state: PipelineState) -> dict:
-    """生成 Markdown 报告。"""
-    print("--> [generate_report] 组装最终排障报告...")
-    
-    report = f"""# SRE 自动排障诊断报告
-    
-## 🎯 失败用例
-`{state.get('test_case_name')}`
 
-## 💥 脚本报错日志
+def evaluate_or_analyze(state: PipelineState) -> dict[str, str]:
+    """Create a deterministic version A analysis."""
+    print("--> [analyzer] building deterministic analysis")
+    test_result = state.get("test_result", {})
+    mcp_error = state.get("mcp_error")
+    timed_out = bool(test_result.get("timed_out", False))
+    lines = [
+        "Version A does not enable LLM deep diagnosis.",
+        f"Pytest exit code: {test_result.get('exit_code', 'unknown')}.",
+    ]
+    if timed_out:
+        lines.append("Pytest timed out; sidecar verdict is blocked.")
+    if state.get("mcp_snapshot_file"):
+        lines.append(f"Sidecar snapshot saved: {state['mcp_snapshot_file']}.")
+    if state.get("observability_status") == "error_detected":
+        lines.append("Pytest passed, but sidecar ERROR log probe found evidence.")
+    if mcp_error:
+        lines.append(
+            "Sidecar observation failed; this is an observation failure, "
+            "not proof of an application failure."
+        )
+        lines.append(f"MCP error: {mcp_error}.")
+    analysis_result = "\n".join(lines)
+    return {"analysis_result": analysis_result}
+
+
+def generate_report(state: PipelineState) -> dict[str, str]:
+    """Generate a Markdown report and write it to disk."""
+    print("--> [generate_report] writing Markdown report")
+    report_dir = Path(state.get("report_dir", ".traces/test-debug-agent"))
+    report_dir.mkdir(parents=True, exist_ok=True)
+    timestamp = time.strftime("%Y%m%d-%H%M%S")
+    case_slug = _slugify(state.get("test_case_name", "pytest-target"))
+    report_path = report_dir / f"{timestamp}-{case_slug}.md"
+
+    test_result = state.get("test_result", {})
+    command = " ".join(str(part) for part in test_result.get("command", []))
+    stderr_tail = _tail(str(test_result.get("stderr", "")))
+    stdout_tail = _tail(str(test_result.get("stdout", "")))
+    snapshot_summary = state.get("mcp_snapshot_summary")
+
+    report = f"""# test-debug-agent Report
+
+## Pytest
+- Target: `{state.get("pytest_target", "")}`
+- Command: `{command}`
+- Exit code: `{test_result.get("exit_code", "unknown")}`
+- Duration seconds: `{test_result.get("duration_seconds", "unknown")}`
+- Timed out: `{test_result.get("timed_out", False)}`
+
+## Sidecar MCP
+- Snapshot file: `{state.get("mcp_snapshot_file") or ""}`
+- MCP error: `{state.get("mcp_error") or ""}`
+- Observability status: `{state.get("observability_status", "")}`
+
 ```text
-{state.get('test_result', {}).get('stderr', '无')}
+{snapshot_summary or ""}
 ```
 
-## 🔍 环境基建异动 (Snapshot Diff)
+## Observability evidence
 ```text
-{state.get('state_diff')}
+{_tail(state.get("observability_evidence", "")) or "(empty)"}
 ```
 
-## 🧠 AI 诊断结论
-> {state.get('analysis_result')}
+## stderr tail
+```text
+{stderr_tail or "(empty)"}
+```
+
+## stdout tail
+```text
+{stdout_tail or "(empty)"}
+```
+
+## Snapshot diff
+```text
+{state.get("state_diff", "")}
+```
+
+## Analysis
+```text
+{state.get("analysis_result", "")}
+```
 """
-    return {"final_report": report}
+    report_path.write_text(report, encoding="utf-8")
+    return {"final_report": report, "report_path": str(report_path)}
+
+
+def _tail(text: str) -> str:
+    return text[-TAIL_CHARS:]
+
+
+def _slugify(value: str) -> str:
+    slug = re.sub(r"[^A-Za-z0-9_.-]+", "-", value).strip("-")
+    return slug[:120] or "pytest-target"
